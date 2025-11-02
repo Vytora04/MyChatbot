@@ -1,89 +1,238 @@
 import streamlit as st
-from langchain.chat_models import ChatOllama
-from langchain.schema import HumanMessage, AIMessage
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from datetime import datetime
 
-# ---- Streamlit Setup ---- #
 st.set_page_config(layout="wide")
 st.title("My Local Chatbot")
-
-# ---- Sidebar Inputs ---- #
 st.sidebar.header("Settings")
 
-# Dropdown for model selection
-model_options = ["mistral", "qwen3:4b"]
+model_options = ["mistral", "phi3.5", "qwen3:4b"]
 MODEL = st.sidebar.selectbox("Choose a Model", model_options, index=0)
+
+# Advanced settings (temperature / sampling / max tokens)
+with st.sidebar.expander("Advanced settings", expanded=False):
+    TEMPERATURE = st.slider("Temperature", 0.0, 1.5, 0.7, 0.05, help="Higher = more creative")
+    TOP_P = st.slider("Top-p", 0.0, 1.0, 0.9, 0.05, help="Nucleus sampling")
+    TOP_K = st.slider("Top-k", 1, 200, 40, 1, help="Sample from top-k tokens")
+    MAX_TOKENS = st.slider("Max tokens", 32, 4096, 512, 32, help="Maximum new tokens to generate")
+
+with st.sidebar.expander("Summary settings", expanded=False):
+    SUMMARY_MAX_BULLETS = st.slider("Max bullets", 3, 10, 5, 1)
+    SUMMARY_MAX_TOKENS = st.slider("Summary max tokens", 64, 512, 192, 32)
+    SUMMARY_STYLE = st.radio("Summary style", ["Auto", "Paragraph", "Bullets"], index=0, horizontal=True)
 
 # Inputs for max history and context size
 MAX_HISTORY = st.sidebar.number_input("Max History", min_value=1, max_value=10, value=2, step=1)
-CONTEXT_SIZE = st.sidebar.number_input("Context Size", min_value=1024, max_value=16384, value=8192, step=1024)
+CONTEXT_SIZE = st.sidebar.number_input("Context Size", min_value=1024, max_value=16384, value=4096, step=1024)
 
-# ---- Function to Clear Memory When Settings Change ---- #
 def clear_memory():
     st.session_state.chat_history = []
-    st.session_state.memory = ConversationBufferMemory(return_messages=True)  # Reset memory
+    st.session_state.memory = ChatMessageHistory()
 
-# Clear memory if settings are changed
+def ensure_history_store():
+    if "history_sessions" not in st.session_state:
+        st.session_state.history_sessions = []
+
+def archive_current_session(reason: str = "settings-change"):
+    """Save the current chat to the in-session history list (ephemeral)."""
+    ensure_history_store()
+    if st.session_state.get("chat_history"):
+        st.session_state.history_sessions.append({
+            "model": st.session_state.get("prev_model", MODEL),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "messages": list(st.session_state.chat_history),
+        })
+
 if "prev_context_size" not in st.session_state or st.session_state.prev_context_size != CONTEXT_SIZE:
+    archive_current_session("context-size-change")
     clear_memory()
     st.session_state.prev_context_size = CONTEXT_SIZE
 
-# ---- Initialize Chat Memory ---- #
+# Reset model settings if any of the advanced settings change
+if (
+    "prev_model" not in st.session_state
+    or st.session_state.prev_model != MODEL
+    or "prev_temperature" not in st.session_state
+    or st.session_state.prev_temperature != TEMPERATURE
+    or "prev_top_p" not in st.session_state
+    or st.session_state.prev_top_p != TOP_P
+    or "prev_top_k" not in st.session_state
+    or st.session_state.prev_top_k != TOP_K
+    or "prev_max_tokens" not in st.session_state
+    or st.session_state.prev_max_tokens != MAX_TOKENS
+):
+    archive_current_session("model-or-params-change")
+    clear_memory()
+    st.session_state.prev_model = MODEL
+    st.session_state.prev_temperature = TEMPERATURE
+    st.session_state.prev_top_p = TOP_P
+    st.session_state.prev_top_k = TOP_K
+    st.session_state.prev_max_tokens = MAX_TOKENS
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(return_messages=True)
+    st.session_state.memory = ChatMessageHistory()
 
-# ---- LangChain LLM Setup ---- #
-llm = ChatOllama(model=MODEL, streaming=True)
-
-# ---- Prompt Template ---- #
-prompt_template = PromptTemplate(
-    input_variables=["history", "human_input"],
-    template="{history}\nUser: {human_input}\nAssistant:"
+model = ChatOllama(
+    model=MODEL,
+    streaming=True,
+    num_ctx=CONTEXT_SIZE,
+    temperature=TEMPERATURE,
+    top_p=TOP_P,
+    top_k=TOP_K,
+    num_predict=MAX_TOKENS,
 )
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful AI assistant. Keep answers concise unless asked for detail."),
+    MessagesPlaceholder("history"),
+    ("human", "{input}")
+])
+chain = prompt | model | StrOutputParser()
 
-chain = LLMChain(llm=llm, prompt=prompt_template, memory=st.session_state.memory)
-
-# ---- Display Chat History ---- #
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# ---- Trim Function (Removes Oldest Messages) ---- #
+# Sidebar: History controls
+ensure_history_store()
+with st.sidebar.expander("History", expanded=False):
+    st.caption(f"Saved this session: {len(st.session_state.history_sessions)} chats")
+    if st.button("New Chat", use_container_width=True):
+        archive_current_session("manual-new-chat")
+        clear_memory()
+    if st.session_state.history_sessions:
+        labels = [f"{idx+1}. {s['model']} — {s['created_at']} ({len(s['messages'])} msgs)" for idx, s in enumerate(st.session_state.history_sessions)]
+        sel = st.selectbox("Past chats", options=list(range(len(labels))), format_func=lambda i: labels[i])
+        if sel is not None:
+            transcript = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in st.session_state.history_sessions[sel]["messages"]])
+            st.text_area("Preview", transcript, height=150)
+        if st.button("Clear history"):
+            st.session_state.history_sessions = []
+
+def summarize_conversation():
+    if not st.session_state.chat_history:
+        st.sidebar.info("No messages to summarize yet.")
+        return
+    # Compose a text transcript from our UI history
+    transcript = "\n".join(
+        [f"{m['role'].capitalize()}: {m['content']}" for m in st.session_state.chat_history]
+    )
+    # Dynamic length budget: about half of the chat length, within bounds
+    char_limit = min(800, max(200, int(len(transcript) * 0.5)))
+
+    sum_model = ChatOllama(
+        model=MODEL,
+        streaming=False,
+        num_ctx=CONTEXT_SIZE,
+        temperature=min(0.7, TEMPERATURE),
+        top_p=TOP_P,
+        top_k=TOP_K,
+        num_predict=SUMMARY_MAX_TOKENS,
+    )
+    # Style-aware prompt
+    if SUMMARY_STYLE == "Paragraph":
+        sys_msg = (
+            f"Summarize the conversation as a single short paragraph under {char_limit} characters. "
+            "No bullet points. Be concise and avoid repetition. Do not include word/character counts or length statements."
+        )
+    elif SUMMARY_STYLE == "Bullets":
+        sys_msg = (
+            f"Summarize the conversation as at most {SUMMARY_MAX_BULLETS} concise bullet points under {char_limit} characters. "
+            "One line per bullet. Avoid filler. Do not include word/character counts or length statements."
+        )
+    else:
+        sys_msg = (
+            f"Write a concise summary under {char_limit} characters. Prefer a short paragraph for simple topics; "
+            f"use up to {SUMMARY_MAX_BULLETS} bullets only if it improves clarity. Avoid repetition. "
+            "Do not include word/character counts or length statements."
+        )
+
+    sum_prompt = ChatPromptTemplate.from_messages([
+        ("system", sys_msg),
+        ("human", "{conversation}")
+    ])
+    sum_chain = sum_prompt | sum_model | StrOutputParser()
+    with st.spinner("Summarizing chat…"):
+        summary = sum_chain.invoke({"conversation": transcript})
+
+    # Remove any accidental word/character count lines from model output
+    def _strip_meta(text: str) -> str:
+        lines = []
+        for line in text.splitlines():
+            lower = line.strip().lower()
+            if (
+                "word count" in lower or
+                "character count" in lower or
+                "characters:" in lower or
+                "words:" in lower or
+                "under the character limit" in lower
+            ):
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+    summary = _strip_meta(summary)
+
+    # If the summary is too long, do a concise rewrite pass respecting the chosen style
+    if len(summary) >= len(transcript) or len(summary) > char_limit:
+        if SUMMARY_STYLE == "Paragraph":
+            rewrite_sys = f"Rewrite as a single short paragraph under {char_limit} characters. No bullets."
+        elif SUMMARY_STYLE == "Bullets":
+            rewrite_sys = f"Rewrite as at most {SUMMARY_MAX_BULLETS} one-line bullet points under {char_limit} characters."
+        else:
+            rewrite_sys = (
+                f"Rewrite to be under {char_limit} characters. Prefer a short paragraph; use up to {SUMMARY_MAX_BULLETS} bullets only if clearer."
+            )
+        rewrite_prompt = ChatPromptTemplate.from_messages([
+            ("system", rewrite_sys),
+            ("human", "{draft}")
+        ])
+        rewrite_chain = rewrite_prompt | sum_model | StrOutputParser()
+        summary = _strip_meta(rewrite_chain.invoke({"draft": summary}))
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Chat Summary")
+    st.sidebar.markdown(summary)
+
+if st.sidebar.button("Summarize Chat", use_container_width=True):
+    summarize_conversation()
+
 def trim_memory():
     while len(st.session_state.chat_history) > MAX_HISTORY * 2:  # Each cycle has 2 messages (User + AI)
         st.session_state.chat_history.pop(0)  # Remove oldest User message
         if st.session_state.chat_history:
             st.session_state.chat_history.pop(0)  # Remove oldest AI response
 
-# ---- Handle User Input ---- #
-if prompt := st.chat_input("Say something"):
+if user_input := st.chat_input("Say something"):
     # Show User Input Immediately
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(user_input)
 
-    st.session_state.chat_history.append({"role": "user", "content": prompt})  # Store user input
+    st.session_state.chat_history.append({"role": "user", "content": user_input})  # Store user input
 
-    # Trim chat history before generating response
     trim_memory()
 
-    # ---- Get AI Response (Streaming) ---- #
     with st.chat_message("assistant"):
         response_container = st.empty()
         full_response = ""
 
-        for chunk in chain.stream({"human_input": prompt}):
-            if isinstance(chunk, dict) and "text" in chunk:
-                text_chunk = chunk["text"]
-                full_response += text_chunk
+        lc_history = st.session_state.memory.messages
+
+        # Stream response from the chain
+        for chunk in chain.stream({"history": lc_history, "input": user_input}):
+            if chunk:
+                full_response += chunk
                 response_container.markdown(full_response)
 
-    # Store response in session_state
     st.session_state.chat_history.append({"role": "assistant", "content": full_response})
 
-    # Trim history after storing the response
+    st.session_state.memory.add_user_message(user_input)
+    st.session_state.memory.add_ai_message(full_response)
+
     trim_memory()
